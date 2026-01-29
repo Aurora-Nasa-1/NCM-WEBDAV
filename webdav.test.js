@@ -4,7 +4,7 @@ const assert = require('assert');
 async function testOptions() {
     return new Promise((resolve, reject) => {
         const req = http.request({
-            hostname: 'localhost',
+            hostname: '127.0.0.1',
             port: 3001,
             path: '/',
             method: 'OPTIONS'
@@ -33,4 +33,5 @@ async function runTests() {
 }
 
 // Give server some time to start if run externally, or we could start it here.
-setTimeout(runTests, 2000);
+console.log('Waiting 5s for server to initialize...');
+setTimeout(runTests, 5000);

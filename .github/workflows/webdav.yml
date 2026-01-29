@@ -15,5 +15,5 @@ jobs:
       - name: Run WebDAV test
         run: |
           node webdav.js &
-          sleep 10
+          sleep 15
           node webdav.test.js
