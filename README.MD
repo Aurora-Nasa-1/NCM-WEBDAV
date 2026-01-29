@@ -212,6 +212,76 @@ pnpm test
 
 - [qier2222/YesPlayMusic](https://github.com/qier222/YesPlayMusic)
 
+## Termux 部署
+
+本项目支持在 Termux (Android) 上运行，非常适合将旧手机变为音乐服务器。
+
+### 1. 安装环境
+在 Termux 中执行以下命令：
+```bash
+pkg update && pkg upgrade
+pkg install nodejs git
+```
+
+### 2. 获取代码与运行
+```bash
+git clone https://github.com/neteasecloudmusicapienhanced/api-enhanced.git
+cd api-enhanced
+chmod +x start.sh
+./start.sh
+```
+
+### 3. 注意事项
+- **QR 登录**: 首次启动会显示二维码，请使用网易云音乐 App 扫描。如果二维码显示不全或乱码，请尝试缩小终端字体。
+- **后台运行**: 建议在 Termux 中开启 `Acquire wakelock` 以防止系统休眠导致服务中断。
+- **自动更新**: `start.sh` 脚本在每次启动时都会尝试 `git pull` 更新代码并自动安装依赖。
+
+## WebDAV 使用指南
+
+本项目内置了 WebDAV 服务，可以将网易云音乐的歌单、每日推荐等挂载为本地网络驱动器。
+
+### 1. 优势
+- **高性能**: 采用 HTTP 302 重定向技术，直接从网易云服务器获取音频流，低延迟且不消耗服务器流量。
+- **多端同步**: 只要有 WebDAV 客户端，即可在各种播放器中直接播放。
+- **音质可选**: 支持从标准到母带质量的多种音质。
+
+### 2. 配置说明 (`webdav_config.json`)
+你可以通过修改根目录下的 `webdav_config.json` 来调整服务：
+```json
+{
+  "port": 3001,
+  "quality": "exhigh",
+  "cacheTTL": 300000
+}
+```
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `port` | 3001 | WebDAV 服务端口 |
+| `quality` | `exhigh` | 音质等级 (见下表) |
+| `cacheTTL` | 300000 | 资源列表缓存时间 (毫秒) |
+
+**音质选项 (`quality`):**
+- `standard`: 标准 (128kbps)
+- `exhigh`: 极高 (320kbps)
+- `lossless`: 无损
+- `hires`: Hi-Res
+- `jyeffect`: 高清环绕声 (HD surround)
+- `sky`: 沉浸环绕声 (Sky)
+- `jymaster`: 超解析母带 (Master)
+
+### 3. 便携使用与远程访问
+- **内网使用**: 在同一 Wi-Fi 下，通过 `http://手机IP:3001` 访问。
+- **远程访问**: 建议配合 [Tailscale](https://tailscale.com/) 或 [ZeroTier] 使用，无需公网 IP 即可在任何地方通过虚拟内网访问你的私有音乐服务。
+- **挂载路径**:
+    - `/每日推荐歌曲`: 你的每日私享歌曲。
+    - `/每日推荐歌单`: 发现更多好音乐。
+    - `/我的歌单`: 你收藏和创建的所有歌单。
+
+### 4. 推荐客户端
+- **Android**: Solid Explorer, VLC, Neutron Player
+- **iOS**: Infuse, Fileball, Ever Music
+- **Windows/macOS**: PotPlayer, MPC-HC, Kodi, Infuse
+
 ## License
 
 [MIT License](https://github.com/MoeFurina/NeteaseCloudMusicApiEnhanced/blob/main/LICENSE)
