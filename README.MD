@@ -140,6 +140,23 @@ docker run -d -p 3000:3000 moefurina/ncm-api:latest
    ```
 4. 完成部署后，访问 API 网关的 URL 即可
 
+## WebDAV 服务 (中子播放器支持)
+
+本项目内置了 WebDAV 模拟服务，可将网易云音乐的每日推荐歌曲、歌单映射为虚拟文件系统。
+
+### 启动 WebDAV
+- **Termux/Linux**: 执行 `./start.sh`
+- **Windows**: 执行 `start.bat`
+
+### 扫码登录
+启动后终端会显示二维码，使用网易云音乐 App 扫码即可完成登录。
+
+### 播放器配置
+- **地址**: `http://<您的IP>:3001`
+- **特性**: 每日推荐歌曲、每日推荐歌单、我的歌单、302 直连流式播放。
+
+详细指南请参考 [README_WEBDAV.md](./README_WEBDAV.md)。
+
 ## Node.js 方式调用
 
 支持直接在 Node.js 项目中引入和调用，返回 Promise：
