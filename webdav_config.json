@@ -1,5 +1,7 @@
 {
     "port": 3001,
     "quality": "exhigh",
-    "refreshInterval": 3600000
+    "mode": "speed",
+    "refreshInterval": 3600000,
+    "metadataTTL": 86400000
 }

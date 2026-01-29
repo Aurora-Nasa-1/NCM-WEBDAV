@@ -9,6 +9,8 @@ fi
 # Auto update
 if [ -d .git ]; then
     echo "Checking for updates..."
+    # Avoid conflict with package-lock.json
+    git checkout package-lock.json 2>/dev/null
     git pull
 fi
 
@@ -22,7 +24,7 @@ fi
 PORT=$(grep -oP '"port":\s*\K\d+' webdav_config.json 2>/dev/null || echo 3001)
 
 # Get local IP address
-IP_ADDR=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I | awk '{print $1}')
+IP_ADDR=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I 2>/dev/null | awk '{print $1}' || ip addr show | grep -w inet | grep -v 127.0.0.1 | awk '{print $2}' | cut -d/ -f1 | head -n1)
 
 # Start the WebDAV server
 echo "---------------------------------------------------"

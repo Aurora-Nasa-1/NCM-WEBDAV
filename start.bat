@@ -12,6 +12,8 @@ if %errorlevel% neq 0 (
 :: Auto update
 if exist .git (
     echo Checking for updates...
+    :: Avoid conflict with package-lock.json
+    git checkout package-lock.json >nul 2>nul
     git pull
 )
 
