@@ -3,14 +3,17 @@ const path = require('path');
 const fs = require('fs');
 const xml2js = require('xml2js');
 const qrcode = require('qrcode');
+const nodeID3 = require('node-id3');
+const axios = require('axios');
 const api = require('./main');
 const logger = require('./util/logger');
 
 let config = {
     port: 3001,
     quality: 'exhigh',
-    refreshInterval: 3600000,
-    cacheTTL: 300000 // 5 minutes cache for PROPFIND
+    mode: 'speed', // 'speed' or 'experience'
+    cacheTTL: 3600000, // 1 hour cache for PROPFIND
+    metadataTTL: 86400000, // 24 hours for song metadata
 };
 
 if (fs.existsSync('webdav_config.json')) {
@@ -26,14 +29,37 @@ const app = express();
 const PORT = config.port || 3001;
 const DATA_DIR = path.join(__dirname, 'data');
 const COOKIE_FILE = path.join(DATA_DIR, 'cookie.txt');
+const CACHE_FILE = path.join(DATA_DIR, 'webdav_cache.json');
 
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR);
 }
 
 let userCookie = '';
-const songCache = new Map(); // path -> {id}
-const propfindCache = new Map(); // path -> {data, timestamp}
+// Enhanced Cache
+let webdavCache = {
+    songs: {}, // id -> metadata
+    playlists: {}, // id -> { name, trackIds, trackAt, updateTime, timestamp }
+    propfind: {}, // path -> { xml, timestamp }
+};
+
+if (fs.existsSync(CACHE_FILE)) {
+    try {
+        webdavCache = { ...webdavCache, ...JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8')) };
+    } catch (e) {
+        logger.error('Error parsing webdav_cache.json', e);
+    }
+}
+
+function saveCache() {
+    try {
+        fs.writeFileSync(CACHE_FILE, JSON.stringify(webdavCache));
+    } catch (e) {
+        logger.error('Error saving cache', e);
+    }
+}
+
+const songPathMap = new Map(); // path -> songId
 
 // Load cookie from file
 if (fs.existsSync(COOKIE_FILE)) {
@@ -91,11 +117,50 @@ async function login() {
 
 function cleanName(name) {
     if (!name) return 'Unknown';
-    return name.toString().replace(/[\\/:*?"<>|]/g, '_');
+    return name.toString().replace(/[\\/:*?"<>|]/g, '_').trim();
+}
+
+function getExtension(song) {
+    // Determine extension based on available quality
+    // This is a hint for the player
+    if (config.quality === 'lossless' || config.quality === 'hires' || config.quality === 'jymaster') {
+        return '.flac';
+    }
+    return '.mp3';
 }
 
 const todayDate = new Date();
 todayDate.setHours(0, 0, 0, 0);
+
+// Helper to fetch song details in batches
+async function getSongsDetails(ids) {
+    const missingIds = ids.filter(id => !webdavCache.songs[id] || (Date.now() - (webdavCache.songs[id].timestamp || 0) > config.metadataTTL));
+
+    if (missingIds.length > 0) {
+        // Batch in 50s
+        for (let i = 0; i < missingIds.length; i += 50) {
+            const batch = missingIds.slice(i, i + 50);
+            try {
+                const res = await api.song_detail({ ids: batch.join(','), cookie: userCookie });
+                res.body.songs.forEach(s => {
+                    webdavCache.songs[s.id] = {
+                        id: s.id,
+                        name: s.name,
+                        ar: s.ar.map(a => a.name).join(','),
+                        al: s.al.name,
+                        picUrl: s.al.picUrl,
+                        publishTime: s.publishTime,
+                        timestamp: Date.now()
+                    };
+                });
+            } catch (e) {
+                logger.error('Error fetching song details batch', e);
+            }
+        }
+        saveCache();
+    }
+    return ids.map(id => webdavCache.songs[id]).filter(Boolean);
+}
 
 app.use(async (req, res) => {
     const method = req.method;
@@ -104,7 +169,7 @@ app.use(async (req, res) => {
     if (!(await checkLogin())) {
         if (method === 'OPTIONS') {
             res.set({
-                'Allow': 'OPTIONS, PROPFIND, GET, HEAD',
+                'Allow': 'OPTIONS, PROPFIND, GET, HEAD, COPY, MOVE',
                 'DAV': '1',
             }).status(200).send();
             return;
@@ -115,7 +180,7 @@ app.use(async (req, res) => {
 
     if (method === 'OPTIONS') {
         res.set({
-            'Allow': 'OPTIONS, PROPFIND, GET, HEAD',
+            'Allow': 'OPTIONS, PROPFIND, GET, HEAD, COPY, MOVE',
             'DAV': '1',
         }).send();
         return;
@@ -123,9 +188,9 @@ app.use(async (req, res) => {
 
     if (method === 'PROPFIND') {
         // Check cache
-        const cached = propfindCache.get(urlPath);
+        const cached = webdavCache.propfind[urlPath];
         if (cached && (Date.now() - cached.timestamp < config.cacheTTL)) {
-            res.status(207).set('Content-Type', 'application/xml; charset=utf-8').send(cached.data);
+            res.status(207).set('Content-Type', 'application/xml; charset=utf-8').send(cached.xml);
             return;
         }
         handlePropfind(req, res, urlPath);
@@ -137,8 +202,84 @@ app.use(async (req, res) => {
         return;
     }
 
+    if (method === 'COPY' || method === 'MOVE') {
+        handleCopyMove(req, res, urlPath);
+        return;
+    }
+
     res.status(405).send('Method Not Allowed');
 });
+
+async function handleCopyMove(req, res, urlPath) {
+    const destination = req.get('Destination');
+    if (!destination) {
+        res.status(400).send('Destination header missing');
+        return;
+    }
+
+    try {
+        const destPath = decodeURIComponent(new URL(destination, `http://${req.headers.host}`).pathname).replace(/\/$/, '');
+
+        // Check if destination is in "我的歌单"
+        const match = destPath.match(/^\/我的歌单\/([^/]+)/);
+        if (!match) {
+            res.status(403).send('Only copying/moving to "我的歌单" is supported for favorite logic');
+            return;
+        }
+
+        const playlistName = match[1];
+        let songId = songPathMap.get(urlPath);
+
+        if (!songId) {
+            // Try fallback search if songId not in map
+            const songMatch = urlPath.match(/\/([^/]+)\s-\s([^/]+)\.(mp3|flac)$/);
+            if (songMatch) {
+                const searchRes = await api.search({ keywords: songMatch[1] + ' ' + songMatch[2], type: 1, cookie: userCookie });
+                if (searchRes.body.result && searchRes.body.result.songs && searchRes.body.result.songs.length > 0) {
+                    songId = searchRes.body.result.songs[0].id;
+                }
+            }
+        }
+
+        if (!songId) {
+            res.status(404).send('Source song not found');
+            return;
+        }
+
+        // Find playlist ID
+        const profileRes = await api.login_status({ cookie: userCookie });
+        const uid = profileRes.body.data.profile.userId;
+        const playlistsRes = await api.user_playlist({ uid, cookie: userCookie, limit: 1000 });
+        const playlist = playlistsRes.body.playlist.find(p => cleanName(p.name) === playlistName);
+
+        if (!playlist) {
+            res.status(404).send('Target playlist not found');
+            return;
+        }
+
+        logger.info(`Adding song ${songId} to playlist ${playlist.id} (${playlistName})`);
+        const result = await api.playlist_tracks({
+            op: 'add',
+            pid: playlist.id,
+            tracks: songId.toString(),
+            cookie: userCookie
+        });
+
+        if (result.body.code === 200 || result.body.code === 502) { // 502 sometimes means song already in playlist
+            res.status(201).send('Created');
+            // Invalidate cache
+            delete webdavCache.propfind[destPath];
+            delete webdavCache.propfind['/我的歌单/' + playlistName];
+            saveCache();
+        } else {
+            res.status(result.body.code || 500).send(result.body.message || 'Error adding song to playlist');
+        }
+
+    } catch (e) {
+        logger.error('Copy/Move error:', e);
+        res.status(500).send('Internal Server Error');
+    }
+}
 
 async function handlePropfind(req, res, urlPath) {
     let resources = [];
@@ -154,11 +295,17 @@ async function handlePropfind(req, res, urlPath) {
             const songsRes = await api.recommend_songs({ cookie: userCookie });
             const songs = songsRes.body.data.dailySongs;
             resources = [{ name: '每日推荐歌曲', type: 'collection', mtime: todayDate }];
-            songs.forEach(s => {
-                const filename = `${cleanName(s.name)} - ${cleanName(s.ar.map(a => a.name).join(','))}.mp3`;
+
+            const songIds = songs.map(s => s.id);
+            const details = await getSongsDetails(songIds);
+
+            details.forEach(s => {
+                const ext = getExtension(s);
+                const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                 const fullPath = `/每日推荐歌曲/${filename}`;
-                resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime: todayDate });
-                songCache.set(fullPath, { id: s.id });
+                const mtime = s.publishTime ? new Date(s.publishTime) : todayDate;
+                resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
+                songPathMap.set(fullPath, s.id);
             });
         } else if (urlPath === '/每日推荐歌单') {
             const resrcRes = await api.recommend_resource({ cookie: userCookie });
@@ -172,15 +319,22 @@ async function handlePropfind(req, res, urlPath) {
             const resrcRes = await api.recommend_resource({ cookie: userCookie });
             const playlist = resrcRes.body.recommend.find(p => cleanName(p.name) === playlistName);
             if (playlist) {
-                const detailRes = await api.playlist_track_all({ id: playlist.id, cookie: userCookie });
-                const songs = detailRes.body.songs;
-                const mtime = new Date(playlist.createTime || todayDate);
-                resources = [{ name: playlistName, type: 'collection', mtime }];
-                songs.forEach(s => {
-                    const filename = `${cleanName(s.name)} - ${cleanName(s.ar.map(a => a.name).join(','))}.mp3`;
+                const detailRes = await api.playlist_detail({ id: playlist.id, cookie: userCookie });
+                const trackIds = detailRes.body.playlist.trackIds.map(t => t.id);
+                const trackAtMap = {};
+                detailRes.body.playlist.trackIds.forEach(t => trackAtMap[t.id] = t.at);
+
+                const details = await getSongsDetails(trackIds);
+                const playlistMtime = new Date(playlist.createTime || todayDate);
+                resources = [{ name: playlistName, type: 'collection', mtime: playlistMtime }];
+
+                details.forEach(s => {
+                    const ext = getExtension(s);
+                    const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                     const fullPath = `${urlPath}/${filename}`;
+                    const mtime = trackAtMap[s.id] ? new Date(trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
                     resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
-                    songCache.set(fullPath, { id: s.id });
+                    songPathMap.set(fullPath, s.id);
                 });
             }
         } else if (urlPath === '/我的歌单') {
@@ -199,20 +353,32 @@ async function handlePropfind(req, res, urlPath) {
             const playlistsRes = await api.user_playlist({ uid, cookie: userCookie, limit: 1000 });
             const playlist = playlistsRes.body.playlist.find(p => cleanName(p.name) === playlistName);
             if (playlist) {
-                const detailRes = await api.playlist_track_all({ id: playlist.id, cookie: userCookie });
-                const songs = detailRes.body.songs;
-                const mtime = new Date(playlist.updateTime || todayDate);
-                resources = [{ name: playlistName, type: 'collection', mtime }];
-                songs.forEach(s => {
-                    const filename = `${cleanName(s.name)} - ${cleanName(s.ar.map(a => a.name).join(','))}.mp3`;
+                const detailRes = await api.playlist_detail({ id: playlist.id, cookie: userCookie });
+                const trackIds = detailRes.body.playlist.trackIds.map(t => t.id);
+                const trackAtMap = {};
+                detailRes.body.playlist.trackIds.forEach(t => trackAtMap[t.id] = t.at);
+
+                const details = await getSongsDetails(trackIds);
+                const playlistMtime = new Date(playlist.updateTime || todayDate);
+                resources = [{ name: playlistName, type: 'collection', mtime: playlistMtime }];
+
+                details.forEach(s => {
+                    const ext = getExtension(s);
+                    const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                     const fullPath = `${urlPath}/${filename}`;
+                    const mtime = trackAtMap[s.id] ? new Date(trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
                     resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
-                    songCache.set(fullPath, { id: s.id });
+                    songPathMap.set(fullPath, s.id);
                 });
             }
+        } else if (urlPath.endsWith('/cover.jpg') || urlPath.endsWith('/folder.jpg')) {
+            resources = [{ name: path.basename(urlPath), type: 'file', size: 1024 * 1024, mtime: todayDate }];
         } else {
-             if (songCache.has(urlPath)) {
-                resources = [{ name: path.basename(urlPath), type: 'file', size: 10 * 1024 * 1024, mtime: todayDate }];
+             if (songPathMap.has(urlPath)) {
+                const songId = songPathMap.get(urlPath);
+                const s = webdavCache.songs[songId];
+                const mtime = s && s.publishTime ? new Date(s.publishTime) : todayDate;
+                resources = [{ name: path.basename(urlPath), type: 'file', size: 10 * 1024 * 1024, mtime }];
             } else {
                 res.status(404).send('Not Found');
                 return;
@@ -244,7 +410,7 @@ async function handlePropfind(req, res, urlPath) {
                         'D:resourcetype': isCol ? { 'D:collection': {} } : {},
                         ...(isCol ? {} : {
                             'D:getcontentlength': r.size,
-                            'D:getcontenttype': 'audio/mpeg',
+                            'D:getcontenttype': r.name.endsWith('.flac') ? 'audio/flac' : 'audio/mpeg',
                         }),
                         'D:getlastmodified': (r.mtime || todayDate).toUTCString(),
                     },
@@ -255,16 +421,29 @@ async function handlePropfind(req, res, urlPath) {
     };
 
     const xml = xmlBuilder.buildObject(response);
-    propfindCache.set(urlPath, { data: xml, timestamp: Date.now() });
+    webdavCache.propfind[urlPath] = { xml, timestamp: Date.now() };
+    saveCache();
     res.status(207).set('Content-Type', 'application/xml; charset=utf-8').send(xml);
 }
 
 async function handleGet(req, res, urlPath, isHead) {
-    const cached = songCache.get(urlPath);
-    let songId = cached ? cached.id : null;
+    if (urlPath.endsWith('/cover.jpg') || urlPath.endsWith('/folder.jpg')) {
+        handleCoverGet(req, res, urlPath, isHead);
+        return;
+    }
+
+    let songId = songPathMap.get(urlPath);
+
+    if (isHead) {
+        res.status(200).set({
+            'Content-Type': urlPath.endsWith('.flac') ? 'audio/flac' : 'audio/mpeg',
+            'Accept-Ranges': 'none'
+        }).send();
+        return;
+    }
 
     if (!songId) {
-        const match = urlPath.match(/\/([^/]+)\s-\s([^/]+)\.mp3$/);
+        const match = urlPath.match(/\/([^/]+)\s-\s([^/]+)\.(mp3|flac)$/);
         if (match) {
             try {
                 const searchRes = await api.search({ keywords: match[1] + ' ' + match[2], type: 1, cookie: userCookie });
@@ -279,17 +458,18 @@ async function handleGet(req, res, urlPath, isHead) {
 
     if (songId) {
         try {
-            const urlRes = await api.song_url_v1({ id: songId, level: config.quality, cookie: userCookie });
-            if (urlRes.body.data && urlRes.body.data[0]) {
-                const song = urlRes.body.data[0];
-                const songUrl = song.url;
-                if (songUrl) {
-                    if (isHead) {
-                        res.status(200).set({ 'Content-Type': 'audio/mpeg', 'Accept-Ranges': 'bytes' }).send();
-                    } else {
+            if (config.mode === 'experience') {
+                await handleGetExperience(req, res, songId, urlPath);
+                return;
+            } else {
+                const urlRes = await api.song_url_v1({ id: songId, level: config.quality, cookie: userCookie });
+                if (urlRes.body.data && urlRes.body.data[0]) {
+                    const song = urlRes.body.data[0];
+                    const songUrl = song.url;
+                    if (songUrl) {
                         res.redirect(songUrl);
+                        return;
                     }
-                    return;
                 }
             }
         } catch (e) {
@@ -297,6 +477,99 @@ async function handleGet(req, res, urlPath, isHead) {
         }
     }
     res.status(404).send('Song not found');
+}
+
+async function handleCoverGet(req, res, urlPath, isHead) {
+    const dirPath = path.dirname(urlPath);
+    // Find first song in this directory to get cover
+    let picUrl = null;
+    for (const [p, id] of songPathMap.entries()) {
+        if (p.startsWith(dirPath + '/')) {
+            const s = webdavCache.songs[id];
+            if (s && s.picUrl) {
+                picUrl = s.picUrl;
+                break;
+            }
+        }
+    }
+
+    if (!picUrl) {
+        res.status(404).send('Cover not found');
+        return;
+    }
+
+    if (isHead) {
+        res.status(200).set('Content-Type', 'image/jpeg').send();
+        return;
+    }
+
+    try {
+        res.redirect(picUrl);
+    } catch (e) {
+        res.status(500).send('Error');
+    }
+}
+
+async function handleGetExperience(req, res, songId, urlPath) {
+    try {
+        const urlRes = await api.song_url_v1({ id: songId, level: config.quality, cookie: userCookie });
+        const songUrl = urlRes.body.data[0].url;
+        if (!songUrl) {
+            res.status(404).send('Song URL not found');
+            return;
+        }
+
+        const details = await getSongsDetails([songId]);
+        const s = details[0];
+
+        logger.info(`Proxying song ${songId} in experience mode...`);
+        const response = await axios({
+            method: 'get',
+            url: songUrl,
+            responseType: 'arraybuffer'
+        });
+
+        let audioBuffer = Buffer.from(response.data);
+
+        if (urlPath.endsWith('.mp3')) {
+            const tags = {
+                title: s.name,
+                artist: s.ar,
+                album: s.al,
+            };
+
+            if (s.picUrl) {
+                try {
+                    const imageRes = await axios({
+                        method: 'get',
+                        url: s.picUrl,
+                        responseType: 'arraybuffer'
+                    });
+                    tags.image = {
+                        mime: "image/jpeg",
+                        type: { id: 3, name: "front cover" },
+                        description: "Front Cover",
+                        imageBuffer: Buffer.from(imageRes.data),
+                    };
+                } catch (imgErr) {
+                    logger.error('Error fetching album art', imgErr);
+                }
+            }
+            audioBuffer = nodeID3.write(tags, audioBuffer);
+        }
+
+        res.set({
+            'Content-Type': urlPath.endsWith('.flac') ? 'audio/flac' : 'audio/mpeg',
+            'Content-Length': audioBuffer.length,
+            'Accept-Ranges': 'none'
+        });
+
+        res.send(audioBuffer);
+
+    } catch (e) {
+        logger.error('Experience mode error:', e);
+        res.status(500).send('Internal Server Error');
+    }
 }
 
 async function start() {
