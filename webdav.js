@@ -12,17 +12,29 @@ let config = {
     port: 3001,
     quality: 'exhigh',
     mode: 'speed', // 'speed' or 'experience'
-    cacheTTL: 3600000, // 1 hour cache for PROPFIND
+    refreshInterval: 3600000, // 1 hour cache for PROPFIND
     metadataTTL: 86400000, // 24 hours for song metadata
 };
 
 if (fs.existsSync('webdav_config.json')) {
     try {
         const fileConfig = JSON.parse(fs.readFileSync('webdav_config.json', 'utf-8'));
+        // Sync cacheTTL to refreshInterval if needed
+        if (fileConfig.cacheTTL && !fileConfig.refreshInterval) {
+            fileConfig.refreshInterval = fileConfig.cacheTTL;
+            delete fileConfig.cacheTTL;
+        }
         config = { ...config, ...fileConfig };
     } catch (e) {
         logger.error('Error parsing webdav_config.json', e);
     }
+}
+
+// Ensure config file is synced with code
+try {
+    fs.writeFileSync('webdav_config.json', JSON.stringify(config, null, 4));
+} catch (e) {
+    logger.error('Error saving webdav_config.json', e);
 }
 
 const app = express();
@@ -40,26 +52,32 @@ let userCookie = '';
 let webdavCache = {
     songs: {}, // id -> metadata
     playlists: {}, // id -> { name, trackIds, trackAt, updateTime, timestamp }
+    userPlaylists: { data: [], timestamp: 0 },
+    recommendPlaylists: { data: [], timestamp: 0 },
+    dailySongs: { data: [], timestamp: 0 },
     propfind: {}, // path -> { xml, timestamp }
+    songPathMap: {}, // path -> songId
 };
 
 if (fs.existsSync(CACHE_FILE)) {
     try {
-        webdavCache = { ...webdavCache, ...JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8')) };
+        const savedCache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8'));
+        webdavCache = { ...webdavCache, ...savedCache };
     } catch (e) {
         logger.error('Error parsing webdav_cache.json', e);
     }
 }
 
+const songPathMap = new Map(Object.entries(webdavCache.songPathMap || {})); // path -> songId
+
 function saveCache() {
     try {
+        webdavCache.songPathMap = Object.fromEntries(songPathMap);
         fs.writeFileSync(CACHE_FILE, JSON.stringify(webdavCache));
     } catch (e) {
         logger.error('Error saving cache', e);
     }
 }
-
-const songPathMap = new Map(); // path -> songId
 
 // Load cookie from file
 if (fs.existsSync(COOKIE_FILE)) {
@@ -189,7 +207,7 @@ app.use(async (req, res) => {
     if (method === 'PROPFIND') {
         // Check cache
         const cached = webdavCache.propfind[urlPath];
-        if (cached && (Date.now() - cached.timestamp < config.cacheTTL)) {
+        if (cached && (Date.now() - cached.timestamp < config.refreshInterval)) {
             res.status(207).set('Content-Type', 'application/xml; charset=utf-8').send(cached.xml);
             return;
         }
@@ -270,6 +288,8 @@ async function handleCopyMove(req, res, urlPath) {
             // Invalidate cache
             delete webdavCache.propfind[destPath];
             delete webdavCache.propfind['/我的歌单/' + playlistName];
+            delete webdavCache.playlists[playlist.id];
+            if (webdavCache.userPlaylists) webdavCache.userPlaylists.timestamp = 0;
             saveCache();
         } else {
             res.status(result.body.code || 500).send(result.body.message || 'Error adding song to playlist');
@@ -292,8 +312,16 @@ async function handlePropfind(req, res, urlPath) {
                 { name: '我的歌单', type: 'collection', mtime: todayDate },
             ];
         } else if (urlPath === '/每日推荐歌曲') {
-            const songsRes = await api.recommend_songs({ cookie: userCookie });
-            const songs = songsRes.body.data.dailySongs;
+            let songs;
+            const now = Date.now();
+            if (webdavCache.dailySongs && (now - webdavCache.dailySongs.timestamp < config.refreshInterval)) {
+                songs = webdavCache.dailySongs.data;
+            } else {
+                const songsRes = await api.recommend_songs({ cookie: userCookie });
+                songs = songsRes.body.data.dailySongs;
+                webdavCache.dailySongs = { data: songs, timestamp: now };
+                saveCache();
+            }
             resources = [{ name: '每日推荐歌曲', type: 'collection', mtime: todayDate }];
 
             const songIds = songs.map(s => s.id);
@@ -308,65 +336,125 @@ async function handlePropfind(req, res, urlPath) {
                 songPathMap.set(fullPath, s.id);
             });
         } else if (urlPath === '/每日推荐歌单') {
-            const resrcRes = await api.recommend_resource({ cookie: userCookie });
-            const playlists = resrcRes.body.recommend;
+            let playlists;
+            const now = Date.now();
+            if (webdavCache.recommendPlaylists && (now - webdavCache.recommendPlaylists.timestamp < config.refreshInterval)) {
+                playlists = webdavCache.recommendPlaylists.data;
+            } else {
+                const resrcRes = await api.recommend_resource({ cookie: userCookie });
+                playlists = resrcRes.body.recommend;
+                webdavCache.recommendPlaylists = { data: playlists, timestamp: now };
+                saveCache();
+            }
             resources = [{ name: '每日推荐歌单', type: 'collection', mtime: todayDate }];
             playlists.forEach(p => {
                 resources.push({ name: cleanName(p.name), type: 'collection', mtime: new Date(p.createTime || todayDate) });
             });
         } else if (urlPath.startsWith('/每日推荐歌单/')) {
             const playlistName = urlPath.substring('/每日推荐歌单/'.length);
-            const resrcRes = await api.recommend_resource({ cookie: userCookie });
-            const playlist = resrcRes.body.recommend.find(p => cleanName(p.name) === playlistName);
-            if (playlist) {
-                const detailRes = await api.playlist_detail({ id: playlist.id, cookie: userCookie });
-                const trackIds = detailRes.body.playlist.trackIds.map(t => t.id);
-                const trackAtMap = {};
-                detailRes.body.playlist.trackIds.forEach(t => trackAtMap[t.id] = t.at);
+            let playlists;
+            const now = Date.now();
+            if (webdavCache.recommendPlaylists && (now - webdavCache.recommendPlaylists.timestamp < config.refreshInterval)) {
+                playlists = webdavCache.recommendPlaylists.data;
+            } else {
+                const resrcRes = await api.recommend_resource({ cookie: userCookie });
+                playlists = resrcRes.body.recommend;
+                webdavCache.recommendPlaylists = { data: playlists, timestamp: now };
+                saveCache();
+            }
 
-                const details = await getSongsDetails(trackIds);
-                const playlistMtime = new Date(playlist.createTime || todayDate);
+            const playlist = playlists.find(p => cleanName(p.name) === playlistName);
+            if (playlist) {
+                let cachedPlaylist = webdavCache.playlists[playlist.id];
+                if (!cachedPlaylist || (now - cachedPlaylist.timestamp > config.refreshInterval)) {
+                    const detailRes = await api.playlist_detail({ id: playlist.id, cookie: userCookie });
+                    const trackIds = detailRes.body.playlist.trackIds.map(t => t.id);
+                    const trackAtMap = {};
+                    detailRes.body.playlist.trackIds.forEach(t => trackAtMap[t.id] = t.at);
+                    cachedPlaylist = {
+                        name: playlist.name,
+                        trackIds,
+                        trackAtMap,
+                        updateTime: playlist.updateTime || playlist.createTime,
+                        timestamp: now
+                    };
+                    webdavCache.playlists[playlist.id] = cachedPlaylist;
+                    saveCache();
+                }
+
+                const details = await getSongsDetails(cachedPlaylist.trackIds);
+                const playlistMtime = new Date(cachedPlaylist.updateTime || todayDate);
                 resources = [{ name: playlistName, type: 'collection', mtime: playlistMtime }];
 
                 details.forEach(s => {
                     const ext = getExtension(s);
                     const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                     const fullPath = `${urlPath}/${filename}`;
-                    const mtime = trackAtMap[s.id] ? new Date(trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
+                    const mtime = cachedPlaylist.trackAtMap[s.id] ? new Date(cachedPlaylist.trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
                     resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
                     songPathMap.set(fullPath, s.id);
                 });
             }
         } else if (urlPath === '/我的歌单') {
-            const profileRes = await api.login_status({ cookie: userCookie });
-            const uid = profileRes.body.data.profile.userId;
-            const playlistsRes = await api.user_playlist({ uid, cookie: userCookie, limit: 1000 });
-            const playlists = playlistsRes.body.playlist;
+            let playlists;
+            const now = Date.now();
+            if (webdavCache.userPlaylists && (now - webdavCache.userPlaylists.timestamp < config.refreshInterval)) {
+                playlists = webdavCache.userPlaylists.data;
+            } else {
+                const profileRes = await api.login_status({ cookie: userCookie });
+                const uid = profileRes.body.data.profile.userId;
+                const playlistsRes = await api.user_playlist({ uid, cookie: userCookie, limit: 1000 });
+                playlists = playlistsRes.body.playlist;
+                webdavCache.userPlaylists = { data: playlists, timestamp: now };
+                saveCache();
+            }
             resources = [{ name: '我的歌单', type: 'collection', mtime: todayDate }];
             playlists.forEach(p => {
                 resources.push({ name: cleanName(p.name), type: 'collection', mtime: new Date(p.updateTime || todayDate) });
             });
         } else if (urlPath.startsWith('/我的歌单/')) {
             const playlistName = urlPath.substring('/我的歌单/'.length);
-            const profileRes = await api.login_status({ cookie: userCookie });
-            const uid = profileRes.body.data.profile.userId;
-            const playlistsRes = await api.user_playlist({ uid, cookie: userCookie, limit: 1000 });
-            const playlist = playlistsRes.body.playlist.find(p => cleanName(p.name) === playlistName);
-            if (playlist) {
-                const detailRes = await api.playlist_detail({ id: playlist.id, cookie: userCookie });
-                const trackIds = detailRes.body.playlist.trackIds.map(t => t.id);
-                const trackAtMap = {};
-                detailRes.body.playlist.trackIds.forEach(t => trackAtMap[t.id] = t.at);
+            let playlists;
+            const now = Date.now();
+            if (webdavCache.userPlaylists && (now - webdavCache.userPlaylists.timestamp < config.refreshInterval)) {
+                playlists = webdavCache.userPlaylists.data;
+            } else {
+                const profileRes = await api.login_status({ cookie: userCookie });
+                const uid = profileRes.body.data.profile.userId;
+                const playlistsRes = await api.user_playlist({ uid, cookie: userCookie, limit: 1000 });
+                playlists = playlistsRes.body.playlist;
+                webdavCache.userPlaylists = { data: playlists, timestamp: now };
+                saveCache();
+            }
 
-                const details = await getSongsDetails(trackIds);
-                const playlistMtime = new Date(playlist.updateTime || todayDate);
+            const playlist = playlists.find(p => cleanName(p.name) === playlistName);
+            if (playlist) {
+                let cachedPlaylist = webdavCache.playlists[playlist.id];
+                if (!cachedPlaylist || (now - cachedPlaylist.timestamp > config.refreshInterval)) {
+                    const detailRes = await api.playlist_detail({ id: playlist.id, cookie: userCookie });
+                    const trackIds = detailRes.body.playlist.trackIds.map(t => t.id);
+                    const trackAtMap = {};
+                    detailRes.body.playlist.trackIds.forEach(t => trackAtMap[t.id] = t.at);
+                    cachedPlaylist = {
+                        name: playlist.name,
+                        trackIds,
+                        trackAtMap,
+                        updateTime: playlist.updateTime,
+                        timestamp: now
+                    };
+                    webdavCache.playlists[playlist.id] = cachedPlaylist;
+                    saveCache();
+                }
+
+                const details = await getSongsDetails(cachedPlaylist.trackIds);
+                const playlistMtime = new Date(cachedPlaylist.updateTime || todayDate);
                 resources = [{ name: playlistName, type: 'collection', mtime: playlistMtime }];
 
                 details.forEach(s => {
                     const ext = getExtension(s);
                     const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                     const fullPath = `${urlPath}/${filename}`;
-                    const mtime = trackAtMap[s.id] ? new Date(trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
+                    const mtime = cachedPlaylist.trackAtMap[s.id] ? new Date(cachedPlaylist.trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
                     resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
                     songPathMap.set(fullPath, s.id);
                 });
