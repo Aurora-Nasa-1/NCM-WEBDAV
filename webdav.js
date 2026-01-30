@@ -4,6 +4,8 @@ const fs = require('fs');
 const xml2js = require('xml2js');
 const qrcode = require('qrcode');
 const nodeID3 = require('node-id3');
+const flacMetadata = require('flac-metadata');
+const stream = require('stream');
 const axios = require('axios');
 const api = require('./main');
 const logger = require('./util/logger');
@@ -116,6 +118,7 @@ async function login() {
                         if (Array.isArray(userCookie)) userCookie = userCookie.join('; ');
                         fs.writeFileSync(COOKIE_FILE, userCookie);
                         clearInterval(timer);
+                        syncAllData();
                         resolve(true);
                     } else if (statusRes.body.code === 800) {
                         console.log('QR code expired. Please restart.');
@@ -139,12 +142,25 @@ function cleanName(name) {
 }
 
 function getExtension(song) {
-    // Determine extension based on available quality
-    // This is a hint for the player
-    if (config.quality === 'lossless' || config.quality === 'hires' || config.quality === 'jymaster') {
-        return '.flac';
+    if (!song) return '.mp3';
+    const q = config.quality;
+    // These qualities usually return FLAC if available
+    if (['jymaster', 'hires', 'lossless', 'sky', 'jyeffect'].includes(q)) {
+        if (song.hrSize || song.sqSize) return '.flac';
     }
     return '.mp3';
+}
+
+function getSongSize(song) {
+    if (!song) return 10 * 1024 * 1024;
+    const q = config.quality;
+    let size = 0;
+    if (['jymaster', 'hires'].includes(q)) size = song.hrSize || song.sqSize || song.hSize || song.mSize || song.lSize;
+    else if (q === 'lossless') size = song.sqSize || song.hSize || song.mSize || song.lSize;
+    else if (q === 'exhigh') size = song.hSize || song.mSize || song.lSize;
+    else size = song.mSize || song.lSize || song.hSize;
+
+    return size || 10 * 1024 * 1024;
 }
 
 const todayDate = new Date();
@@ -168,7 +184,12 @@ async function getSongsDetails(ids) {
                         al: s.al.name,
                         picUrl: s.al.picUrl,
                         publishTime: s.publishTime,
-                        timestamp: Date.now()
+                        timestamp: Date.now(),
+                        hSize: s.h ? s.h.size : 0,
+                        mSize: s.m ? s.m.size : 0,
+                        lSize: s.l ? s.l.size : 0,
+                        sqSize: s.sq ? s.sq.size : 0,
+                        hrSize: s.hr ? s.hr.size : 0,
                     };
                 });
             } catch (e) {
@@ -332,7 +353,7 @@ async function handlePropfind(req, res, urlPath) {
                 const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                 const fullPath = `/每日推荐歌曲/${filename}`;
                 const mtime = s.publishTime ? new Date(s.publishTime) : todayDate;
-                resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
+                resources.push({ name: filename, type: 'file', size: getSongSize(s), mtime });
                 songPathMap.set(fullPath, s.id);
             });
         } else if (urlPath === '/每日推荐歌单') {
@@ -391,7 +412,7 @@ async function handlePropfind(req, res, urlPath) {
                     const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                     const fullPath = `${urlPath}/${filename}`;
                     const mtime = cachedPlaylist.trackAtMap[s.id] ? new Date(cachedPlaylist.trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
-                    resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
+                    resources.push({ name: filename, type: 'file', size: getSongSize(s), mtime });
                     songPathMap.set(fullPath, s.id);
                 });
             }
@@ -455,7 +476,7 @@ async function handlePropfind(req, res, urlPath) {
                     const filename = `${cleanName(s.name)} - ${cleanName(s.ar)}${ext}`;
                     const fullPath = `${urlPath}/${filename}`;
                     const mtime = cachedPlaylist.trackAtMap[s.id] ? new Date(cachedPlaylist.trackAtMap[s.id]) : (s.publishTime ? new Date(s.publishTime) : playlistMtime);
-                    resources.push({ name: filename, type: 'file', size: 10 * 1024 * 1024, mtime });
+                    resources.push({ name: filename, type: 'file', size: getSongSize(s), mtime });
                     songPathMap.set(fullPath, s.id);
                 });
             }
@@ -466,7 +487,7 @@ async function handlePropfind(req, res, urlPath) {
                 const songId = songPathMap.get(urlPath);
                 const s = webdavCache.songs[songId];
                 const mtime = s && s.publishTime ? new Date(s.publishTime) : todayDate;
-                resources = [{ name: path.basename(urlPath), type: 'file', size: 10 * 1024 * 1024, mtime }];
+                resources = [{ name: path.basename(urlPath), type: 'file', size: getSongSize(s), mtime }];
             } else {
                 res.status(404).send('Not Found');
                 return;
@@ -609,54 +630,124 @@ async function handleGetExperience(req, res, songId, urlPath) {
 
         const details = await getSongsDetails([songId]);
         const s = details[0];
+        const isFlac = urlPath.endsWith('.flac');
 
-        logger.info(`Proxying song ${songId} in experience mode...`);
-        const response = await axios({
+        logger.info(`Streaming song ${songId} in experience mode...`);
+
+        // Fetch image if available
+        let imageBuffer = null;
+        if (s.picUrl) {
+            try {
+                const imageRes = await axios({
+                    method: 'get',
+                    url: s.picUrl,
+                    responseType: 'arraybuffer',
+                    timeout: 5000
+                });
+                imageBuffer = Buffer.from(imageRes.data);
+            } catch (e) {
+                logger.error('Error fetching album art', e);
+            }
+        }
+
+        const audioRes = await axios({
             method: 'get',
             url: songUrl,
-            responseType: 'arraybuffer'
+            responseType: 'stream',
+            timeout: 10000
         });
 
-        let audioBuffer = Buffer.from(response.data);
+        res.set({
+            'Content-Type': isFlac ? 'audio/flac' : 'audio/mpeg',
+            'Accept-Ranges': 'none'
+        });
 
-        if (urlPath.endsWith('.mp3')) {
+        if (isFlac) {
+            const processor = new flacMetadata.Processor();
+            let mdbPicture;
+            processor.on('preprocess', (mdb) => {
+                if (mdb.type === flacMetadata.Processor.MDB_TYPE_PICTURE) {
+                    mdb.remove();
+                }
+                if (mdb.isLast) {
+                    mdb.isLast = false;
+                    if (imageBuffer) {
+                        mdbPicture = flacMetadata.data.MetaDataBlockPicture.create(
+                            true, // isLast
+                            3, // pictureType: front cover
+                            'image/jpeg',
+                            '', // description
+                            0, 0, 0, 0, // width, height, depth, colors
+                            imageBuffer
+                        );
+                    } else {
+                        mdb.isLast = true;
+                    }
+                }
+            });
+            processor.on('postprocess', function(mdb) {
+                if (mdbPicture) {
+                    this.push(mdbPicture.publish());
+                    mdbPicture = null;
+                }
+            });
+            audioRes.data.pipe(processor).pipe(res);
+        } else {
             const tags = {
                 title: s.name,
                 artist: s.ar,
                 album: s.al,
             };
 
-            if (s.picUrl) {
-                try {
-                    const imageRes = await axios({
-                        method: 'get',
-                        url: s.picUrl,
-                        responseType: 'arraybuffer'
-                    });
-                    tags.image = {
-                        mime: "image/jpeg",
-                        type: { id: 3, name: "front cover" },
-                        description: "Front Cover",
-                        imageBuffer: Buffer.from(imageRes.data),
-                    };
-                } catch (imgErr) {
-                    logger.error('Error fetching album art', imgErr);
-                }
+            if (imageBuffer) {
+                tags.image = {
+                    mime: "image/jpeg",
+                    type: { id: 3, name: "front cover" },
+                    description: "Front Cover",
+                    imageBuffer: imageBuffer,
+                };
             }
-            audioBuffer = nodeID3.write(tags, audioBuffer);
+            const tagBuffer = nodeID3.create(tags);
+            res.write(tagBuffer);
+            audioRes.data.pipe(res);
         }
-
-        res.set({
-            'Content-Type': urlPath.endsWith('.flac') ? 'audio/flac' : 'audio/mpeg',
-            'Content-Length': audioBuffer.length,
-            'Accept-Ranges': 'none'
-        });
-
-        res.send(audioBuffer);
 
     } catch (e) {
         logger.error('Experience mode error:', e);
-        res.status(500).send('Internal Server Error');
+        if (!res.headersSent) {
+            res.status(500).send('Internal Server Error');
+        }
+    }
+}
+
+async function syncAllData() {
+    if (!(await checkLogin())) return;
+    logger.info('Starting background sync...');
+    try {
+        const profileRes = await api.login_status({ cookie: userCookie });
+        const uid = profileRes.body.data.profile.userId;
+
+        // User playlists
+        const playlistsRes = await api.user_playlist({ uid, cookie: userCookie, limit: 1000 });
+        webdavCache.userPlaylists = { data: playlistsRes.body.playlist, timestamp: Date.now() };
+
+        // Recommend playlists
+        try {
+            const resrcRes = await api.recommend_resource({ cookie: userCookie });
+            webdavCache.recommendPlaylists = { data: resrcRes.body.recommend, timestamp: Date.now() };
+        } catch (e) { logger.error('Sync recommend playlists failed', e); }
+
+        // Daily songs
+        try {
+            const songsRes = await api.recommend_songs({ cookie: userCookie });
+            webdavCache.dailySongs = { data: songsRes.body.data.dailySongs, timestamp: Date.now() };
+            await getSongsDetails(songsRes.body.data.dailySongs.map(s => s.id));
+        } catch (e) { logger.error('Sync daily songs failed', e); }
+
+        saveCache();
+        logger.info('Background sync finished.');
+    } catch (e) {
+        logger.error('Sync error:', e);
     }
 }
 
@@ -673,7 +764,11 @@ async function start() {
         }
     } else {
         console.log('Already logged in.');
+        syncAllData();
     }
+
+    // Background sync every 1 hour
+    setInterval(syncAllData, config.refreshInterval || 3600000);
 
     // Refresh cookie every 24 hours
     setInterval(async () => {
